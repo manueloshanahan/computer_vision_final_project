@@ -3,8 +3,7 @@ Tracker del proyecto: Monitor de postura y distancia.
 
 Sigue las 3 pegatinas de la persona (E, C y H), seleccionadas a mano, con el
 método del Lab 5 D: histograma del tono (canal H de HSV), retroproyección y
-meanShift. Cada región tiene su propio filtro de Kalman de velocidad constante
-(Tema 5) y una zona de búsqueda: una medida de meanShift solo se acepta si cae
+meanShift. Cada región tiene su propio filtro de Kalman de velocidad constante y una zona de búsqueda: una medida de meanShift solo se acepta si cae
 dentro de la elipse de confianza de la predicción (distancia de Mahalanobis).
 
 El ordenador no se mueve, así que solo se selecciona una vez su ROI y se queda fijo
@@ -15,6 +14,7 @@ Uso:
 Teclas: q / ESC = salir, r = volver a seleccionar las regiones.
 """
 
+import os
 import time
 import cv2
 import numpy as np
@@ -22,7 +22,7 @@ import numpy as np
 # ---------------------------------------------------------------- parámetros
 CAMERA_INDEX = 0
 WIDTH, HEIGHT = 1280, 720          # resolución de trabajo del proyecto
-CALIB_FILE = "calibracion.npz"     # generado con CALIBRAR_lab2.ipynb (1920x1080)
+CALIB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calibracion.npz")  # junto a este archivo
 CALIB_WIDTH = 1920                 # ancho de las fotos de calibración
 
 REGIONS = ["E (oreja)", "C (cuello C7)", "H (cadera)"]        # pegatinas que se siguen
@@ -30,12 +30,14 @@ COLORS = [(0, 255, 0), (0, 255, 255), (0, 64, 255)]           # color del rectá
 PC_NAME = "Ordenador"                                         # ROI fijo, sin tracker
 PC_COLOR = (255, 0, 255)
 
-S_MIN = 60          # saturación mínima: los píxeles grises/blancos no cuentan en el histograma
+S_MIN = 60          # saturación mínima: los píxeles grises/blancos no cuentan (¡las pegatinas blancas no sirven!)
 V_MIN = 40          # brillo mínimo: los píxeles muy oscuros tampoco
 HIST_BINS = 30      # número de bins del histograma de tono (0-180)
-GATE = 9.21         # cuantil 0.99 de una chi-cuadrado con 2 grados de libertad (zona de búsqueda)
-MAX_LOST = 10       # tras estos fotogramas sin medida válida, se acepta la de meanShift y se reinicia Kalman
-MIN_BACKPROJ = 0.1  # fracción mínima de la retroproyección dentro de la ventana para fiarse de la medida
+BP_ON = 50          # un píxel de la retroproyección cuenta como "del color de la pegatina" si supera este valor
+MIN_FILL = 0.35     # la medida se acepta si la ventana tiene al menos el 35 % del color que tenía al seleccionarla
+SEARCH_MIN = 1.0    # margen de la zona de búsqueda alrededor de la predicción, en tamaños de pegatina (mín.)
+SEARCH_MAX = 3.0    # (máx.): la zona crece con la incertidumbre de Kalman, pero nunca más que esto
+GATE = 9.21         # cuantil 0.99 de una chi-cuadrado con 2 g.l.: si se supera, es un cambio brusco de postura
 
 
 # ---------------------------------------------------------------- calibración
@@ -62,6 +64,7 @@ class RegionTracker:
         self.w, self.h = w, h
         self.window = (x, y, w, h)
         self.found = True
+        self.lost = 0                                   # fotogramas seguidos sin encontrarla
 
         # Histograma del tono de la selección (como en el Lab 5 D). La máscara quita los
         # píxeles poco saturados o muy oscuros, cuyo tono no es fiable.
@@ -69,6 +72,13 @@ class RegionTracker:
         mask = ((crop[:, :, 1] >= S_MIN) & (crop[:, :, 2] >= V_MIN)).astype(np.uint8) * 255
         self.hist = cv2.calcHist([crop], [0], mask, [HIST_BINS], [0, 180])
         cv2.normalize(self.hist, self.hist, 0, 255, cv2.NORM_MINMAX)
+
+        # Proporción de píxeles "del color" en la selección: referencia para validar medidas
+        bp0 = self._backproject(frame_hsv)[y:y + h, x:x + w]
+        self.fill0 = max(float((bp0 > BP_ON).mean()), 1e-3)
+        if (mask > 0).mean() < 0.05:
+            print(f"Aviso: la región {name} casi no tiene color (¿pegatina blanca, negra o gris?). "
+                  "No se podrá seguir; usad una pegatina de color vivo.")
 
         # Filtro de Kalman: estado (x, y, vx, vy), medida (x, y)
         self.kf = cv2.KalmanFilter(4, 2)
@@ -78,72 +88,83 @@ class RegionTracker:
                                              [0, 0, 0, 1]], np.float32)       # A (velocidad constante)
         self.kf.measurementMatrix = np.array([[1, 0, 0, 0],
                                               [0, 1, 0, 0]], np.float32)      # C (se mide la posición)
-        self.kf.processNoiseCov = np.diag([1.0, 1.0, 10.0, 10.0]).astype(np.float32)  # Q (la persona puede cambiar de velocidad)
+        self.kf.processNoiseCov = np.diag([1.0, 1.0, 10.0, 10.0]).astype(np.float32)  # Q
         self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 4.0       # R
         cx, cy = x + w / 2, y + h / 2
         self.kf.statePost = np.array([[cx], [cy], [0], [0]], np.float32)
         self.kf.errorCovPost = np.eye(4, dtype=np.float32) * 10.0
         self.center = (cx, cy)
-        self.lost = 0   # fotogramas seguidos sin medida aceptada
+        self.last_good = (cx, cy)                       # última posición en la que se vio de verdad
+
+    def _backproject(self, frame_hsv):
+        bp = cv2.calcBackProject([frame_hsv], [0], self.hist, [0, 180], 1)
+        sat_ok = (frame_hsv[:, :, 1] >= S_MIN) & (frame_hsv[:, :, 2] >= V_MIN)
+        bp[~sat_ok] = 0
+        return bp
+
+    def _fill(self, bp, cx, cy):
+        """Proporción de píxeles del color en una ventana del tamaño de la pegatina centrada en (cx, cy)."""
+        H_img, W_img = bp.shape
+        x = int(np.clip(cx - self.w / 2, 0, W_img - self.w))
+        y = int(np.clip(cy - self.h / 2, 0, H_img - self.h))
+        win = bp[y:y + self.h, x:x + self.w]
+        return float((win > BP_ON).mean()) if win.size else 0.0
 
     def update(self, frame_hsv):
-        """Predice, mide con meanShift y corrige solo si la medida cae en la zona de búsqueda."""
+        """Predice, busca con meanShift en la zona de búsqueda y valida la medida."""
         H_img, W_img = frame_hsv.shape[:2]
+        term_crit = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 1)
 
-        # 1) Predicción
+        # 1) Predicción de Kalman
         pred = self.kf.predict()
         px, py = float(pred[0, 0]), float(pred[1, 0])
 
-        # 2) Zona de búsqueda: su tamaño crece con la incertidumbre de la predicción
+        # 2) Zona de búsqueda: crece con la incertidumbre (+-3 sigma), pero acotada entre
+        #    SEARCH_MIN y SEARCH_MAX tamaños de pegatina para que no se vaya a otra parte de la imagen
         Cm = self.kf.measurementMatrix
         S = Cm @ self.kf.errorCovPre @ Cm.T + self.kf.measurementNoiseCov
-        rx = int(3 * np.sqrt(S[0, 0]))          # +-3 sigma en x
-        ry = int(3 * np.sqrt(S[1, 1]))          # +-3 sigma en y
-        sw = int(min(self.w + 2 * rx, W_img))
-        sh = int(min(self.h + 2 * ry, H_img))
-
-        # 3) Medida: meanShift sobre la retroproyección, empezando en la zona de búsqueda
+        rx = float(np.clip(3 * np.sqrt(S[0, 0]), SEARCH_MIN * self.w, SEARCH_MAX * self.w))
+        ry = float(np.clip(3 * np.sqrt(S[1, 1]), SEARCH_MIN * self.h, SEARCH_MAX * self.h))
+        sw, sh = int(min(self.w + 2 * rx, W_img)), int(min(self.h + 2 * ry, H_img))
         x0 = int(np.clip(px - sw / 2, 0, W_img - sw))
         y0 = int(np.clip(py - sh / 2, 0, H_img - sh))
-        backproj = cv2.calcBackProject([frame_hsv], [0], self.hist, [0, 180], 1)
-        sat_ok = (frame_hsv[:, :, 1] >= S_MIN) & (frame_hsv[:, :, 2] >= V_MIN)
-        backproj[~sat_ok] = 0
-        term_crit = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 1)
-        _, (x, y, w, h) = cv2.meanShift(backproj, (x0, y0, sw, sh), term_crit)
+
+        # 3) Medida en dos pasos: meanShift con la ventana grande (encuentra la pegatina en la
+        #    zona) y luego con una ventana del tamaño de la pegatina (centra la medida en ella)
+        bp = self._backproject(frame_hsv)
+        _, (x, y, w, h) = cv2.meanShift(bp, (x0, y0, sw, sh), term_crit)
+        cx, cy = x + w / 2, y + h / 2
+        x1 = int(np.clip(cx - self.w / 2, 0, W_img - self.w))
+        y1 = int(np.clip(cy - self.h / 2, 0, H_img - self.h))
+        _, (x, y, w, h) = cv2.meanShift(bp, (x1, y1, self.w, self.h), term_crit)
         mx, my = x + w / 2, y + h / 2
 
-        # ¿Hay realmente algo del color alrededor de la medida? (ventana del tamaño original)
-        ix = int(np.clip(mx - self.w / 2, 0, W_img - self.w))
-        iy = int(np.clip(my - self.h / 2, 0, H_img - self.h))
-        inside = backproj[iy:iy + self.h, ix:ix + self.w]
-        enough = inside.size > 0 and inside.mean() / 255.0 >= MIN_BACKPROJ
+        # 4) Validación por apariencia: ¿hay en la ventana tanto color como al seleccionarla?
+        ok = self._fill(bp, mx, my) >= MIN_FILL * self.fill0
 
-        # 4) Validación: distancia de Mahalanobis de la innovación (chi-cuadrado, 2 g.l.)
-        d = np.array([[mx - px], [my - py]], np.float32)
-        D2 = (d.T @ np.linalg.inv(S) @ d).item()
-
-        if enough and (D2 <= GATE or self.lost >= MAX_LOST):
-            if D2 > GATE:
-                # Perdida demasiado tiempo: se reinicia el filtro en la nueva medida
+        if ok:
+            d = np.array([[mx - px], [my - py]], np.float32)
+            D2 = (d.T @ np.linalg.inv(S) @ d).item()      # distancia de Mahalanobis
+            if D2 <= GATE:
+                self.kf.correct(np.array([[mx], [my]], np.float32))
+            else:
+                # Movimiento brusco (p.ej. encorvarse de golpe): el modelo de velocidad constante
+                # no lo esperaba, pero la pegatina está ahí -> se reinicia el filtro en la medida
                 self.kf.statePost = np.array([[mx], [my], [0], [0]], np.float32)
                 self.kf.errorCovPost = np.eye(4, dtype=np.float32) * 10.0
-            else:
-                self.kf.correct(np.array([[mx], [my]], np.float32))
-            self.found = True
-            self.lost = 0
+            self.found, self.lost = True, 0
+            self.center = (float(self.kf.statePost[0, 0]), float(self.kf.statePost[1, 0]))
+            self.last_good = self.center
         else:
-            self.found = False   # solo predicción (p.ej., pegatina tapada un momento)
+            # No se ve (tapada, girada...): se queda quieta en la última posición buena, sin
+            # velocidad, y la zona de búsqueda se agranda poco a poco hasta SEARCH_MAX
+            self.found = False
             self.lost += 1
-
-        if self.found:
-            est = self.kf.statePost
-        else:
-            est = pred
-            # Sin corrección, la velocidad estimada se va frenando para no salir disparada
-            self.kf.statePost = pred.copy()
-            self.kf.statePost[2:] *= 0.8
+            gx, gy = self.last_good
+            self.kf.statePost = np.array([[gx], [gy], [0], [0]], np.float32)
             self.kf.errorCovPost = self.kf.errorCovPre.copy()
-        self.center = (float(est[0, 0]), float(est[1, 0]))
+            self.center = self.last_good
+
         self.window = (int(self.center[0] - self.w / 2), int(self.center[1] - self.h / 2), self.w, self.h)
         return self.center, self.found
 
@@ -152,7 +173,7 @@ class RegionTracker:
         thickness = 2 if self.found else 1
         cv2.rectangle(frame, (x, y), (x + w, y + h), self.color, thickness)
         cv2.circle(frame, (int(self.center[0]), int(self.center[1])), 4, self.color, -1)
-        label = self.name if self.found else self.name + " (prediccion)"
+        label = self.name if self.found else self.name + " (buscando)"
         cv2.putText(frame, label, (x, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.color, 2)
 
 

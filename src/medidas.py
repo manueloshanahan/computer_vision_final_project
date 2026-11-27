@@ -15,7 +15,7 @@ import math
 import cv2
 import numpy as np
 
-W_REF_CM = 4.0            # ancho real de la pegatina de escala (MEDIDLO con regla)
+W_REF_CM = 5.9            # ancho real de la pegatina de escala (MEDIDLO con regla)
 S_MIN = 60                # saturación mínima para considerar que un píxel es de la pegatina
 CANNY_LOW, CANNY_HIGH = 50, 150
 HOUGH_THRESHOLD = 40      # votos mínimos en el acumulador
