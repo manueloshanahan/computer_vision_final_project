@@ -27,6 +27,8 @@ from medidas import posture_angles, detect_screen_edge, screen_x_at, measure_sca
 from avisos import Voice, AlertManager
 
 T_PAUSE = 45 * 60          # recordatorio de pausa (s)
+T_LOST = 3.0               # s con alguna pegatina perdida antes de avisar
+T_LOST_REPEAT = 15.0       # s mínimos entre dos avisos de pegatinas perdidas
 GREEN, RED, WHITE, YELLOW = (0, 200, 0), (0, 0, 255), (255, 255, 255), (0, 255, 255)
 
 
@@ -185,6 +187,7 @@ def main():
     trackers, pc_roi, screen, scale = selection
     alerts = AlertManager(voice)
     session_start = last_pause = time.time()
+    lost_since, last_lost_alert = None, -1e9
 
     # 3. VIGILANCIA
     t_prev, fps = time.time(), 0.0
@@ -203,8 +206,20 @@ def main():
         d = distance_cm(E, screen, scale) if found[0] else None
         alerts.update(theta_cv, theta_t, d)
 
-        # Recordatorio de pausas (ampliación)
         now = time.time()
+
+        # Alguna pegatina perdida mucho tiempo: se avisa para que la persona se coloque de perfil
+        if all(found):
+            lost_since = None
+        else:
+            lost_since = now if lost_since is None else lost_since
+            if now - lost_since >= T_LOST and now - last_lost_alert >= T_LOST_REPEAT:
+                missing = ", ".join(t.name.split()[0] for t, f in zip(trackers, found) if not f)
+                voice.say("No veo las pegatinas. Ponte de perfil a la cámara")
+                alerts.last_message, alerts.last_message_t = f"No veo: {missing}", now
+                last_lost_alert = now
+
+        # Recordatorio de pausas (ampliación)
         if now - last_pause >= T_PAUSE:
             voice.say("Llevas mucho tiempo sentado. Haz una pausa")
             alerts.last_message, alerts.last_message_t = "Haz una pausa", now

@@ -245,6 +245,8 @@ def run_security(cap, map1=None, map2=None, on_event=None):
         n_done, frac = decoder.progress()
         stars = " ".join(["*"] * n_done + ["_"] * (4 - n_done))
         cv2.putText(view, f"Codigo: {stars}", (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 0), 3)
+        cv2.putText(view, "b = borrar codigo    q = salir", (20, 130),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
         if frac > 0:   # barra de progreso de la lectura estable
             cv2.rectangle(view, (gx, gy + gh + 10), (gx + int(gw * min(frac, 1)), gy + gh + 22), (0, 255, 0), -1)
         if decoder.wait_left() > 0:
