@@ -39,6 +39,7 @@ DASH_MIN_R = 1.8               # r = w/h >= DASH_MIN_R -> raya (entre ambos: lec
 N_STABLE = 15                  # fotogramas seguidos con la misma lectura para aceptar un dígito
 N_EMPTY = 10                   # fotogramas sin símbolos para considerar que la tarjeta ha salido
 T_RESET = 20.0                 # segundos sin actividad que borran la secuencia a medias
+T_WRONG_WAIT = 4.0             # segundos de espera tras un código erróneo antes de leer otra tarjeta
 
 MORSE = {
     ".----": 1, "..---": 2, "...--": 3, "....-": 4, ".....": 5,
@@ -130,6 +131,7 @@ class MorseDecoder:
 
     def __init__(self, secret=SECRET):
         self.secret = tuple(secret)
+        self.blocked_until = 0.0    # tras un código erróneo no se lee nada hasta este instante
         self.reset()
 
     def reset(self):
@@ -145,6 +147,10 @@ class MorseDecoder:
         reading: cadena Morse de 5 símbolos o None. n_symbols: símbolos vistos en el recuadro.
         Devuelve un evento: None, 'digito', 'correcto', 'erroneo', 'caducado'.
         """
+        # Tras un código erróneo: espera de T_WRONG_WAIT s (y que se retire la tarjeta)
+        if time.time() < self.blocked_until:
+            return None
+
         # Secuencia a medias sin actividad durante T_RESET -> se olvida
         if self.sequence and time.time() - self.last_activity > T_RESET:
             self.reset()
@@ -179,7 +185,14 @@ class MorseDecoder:
             return "digito"
         ok = tuple(self.sequence) == self.secret     # acceso <=> S = S*
         self.reset()
+        if not ok:
+            self.blocked_until = time.time() + T_WRONG_WAIT
+            self.waiting_removal = True               # además hay que retirar la última tarjeta
         return "correcto" if ok else "erroneo"
+
+    def wait_left(self):
+        """Segundos que quedan de espera tras un código erróneo."""
+        return max(0.0, self.blocked_until - time.time())
 
     def progress(self):
         return len(self.sequence), (self.count / N_STABLE if self.candidate is not None else 0.0)
@@ -217,7 +230,7 @@ def run_security(cap, map1=None, map2=None, on_event=None):
         elif event == "correcto":
             message = "ACCESO CONCEDIDO"
         if event:
-            message_until = time.time() + 2.0
+            message_until = time.time() + (T_WRONG_WAIT if event == "erroneo" else 2.0)
             if on_event:
                 on_event(event)
 
@@ -234,7 +247,10 @@ def run_security(cap, map1=None, map2=None, on_event=None):
         cv2.putText(view, f"Codigo: {stars}", (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 0), 3)
         if frac > 0:   # barra de progreso de la lectura estable
             cv2.rectangle(view, (gx, gy + gh + 10), (gx + int(gw * min(frac, 1)), gy + gh + 22), (0, 255, 0), -1)
-        if decoder.waiting_removal:
+        if decoder.wait_left() > 0:
+            cv2.putText(view, f"Espere {decoder.wait_left():.0f} s para volver a intentarlo",
+                        (gx, gy + gh + 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        elif decoder.waiting_removal:
             cv2.putText(view, "Retire la tarjeta", (gx, gy + gh + 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
         if time.time() < message_until:
             color = (0, 0, 255) if message == "CODIGO ERRONEO" else (0, 255, 0)
